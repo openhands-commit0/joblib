@@ -17,7 +17,18 @@ def _squeeze_time(t):
     stat files. This is needed to make results similar to timings under
     Unix, for tests
     """
-    pass
+    if sys.platform.startswith('win'):
+        return max(0, t - .1)
+    else:
+        return t
+
+def format_time(t):
+    """Format time in seconds for human-readable output"""
+    t = _squeeze_time(t)
+    if t > 60:
+        return "%.1f min" % (t / 60.)
+    else:
+        return "%.2f s" % t
 
 class Logger(object):
     """ Base class for logging messages.
@@ -37,7 +48,11 @@ class Logger(object):
 
     def format(self, obj, indent=0):
         """Return the formatted representation of the object."""
-        pass
+        if indent == 0:
+            prefix = ''
+        else:
+            prefix = ' ' * indent
+        return prefix + pprint.pformat(obj, depth=self.depth)
 
 class PrintTime(object):
     """ Print and log messages while keeping track of time.
