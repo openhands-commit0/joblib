@@ -34,6 +34,14 @@ def format_time(t):
     else:
         return "%.2f s" % t
 
+def short_format_time(t):
+    """Format time in seconds for short human-readable output"""
+    t = _squeeze_time(t)
+    if t > 60:
+        return "%.1fm" % (t / 60.)
+    else:
+        return "%.1fs" % t
+
 class Logger(object):
     """ Base class for logging messages.
     """
