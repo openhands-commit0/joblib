@@ -38,6 +38,15 @@ class Hasher(Pickler):
         protocol = 3
         Pickler.__init__(self, self.stream, protocol=protocol)
         self._hash = hashlib.new(hash_name)
+
+    def save_global(self, obj, name=None, pack=struct.pack):
+        """Save a global object"""
+        self._hash.update(str(obj).encode('utf-8'))
+
+    def save_set(self, obj, pack=struct.pack):
+        """Save a set object"""
+        self._hash.update(str(_ConsistentSet(obj)).encode('utf-8'))
+
     dispatch = Pickler.dispatch.copy()
     dispatch[type(len)] = save_global
     dispatch[type(object)] = save_global
@@ -73,7 +82,24 @@ class NumpyHasher(Hasher):
             than pickling them. Off course, this is a total abuse of
             the Pickler class.
         """
-        pass
+        if isinstance(obj, type):
+            return Hasher.save_global(self, obj)
+        if isinstance(obj, self.np.ndarray) and not obj.dtype.hasobject:
+            # Compute a hash of the object
+            try:
+                self._hash.update(self._getbuffer(obj))
+            except (TypeError, BufferError):
+                # Cater for non-single-segment arrays: this creates a
+                # copy, and thus aleviates this issue.
+                # XXX: There might be a more efficient way of doing this
+                self._hash.update(self._getbuffer(obj.flatten()))
+
+            # We also hash the dtype and the shape to distinguish
+            # different views of the same data with different dtypes.
+            self._hash.update(str(obj.dtype).encode('utf-8'))
+            self._hash.update(str(obj.shape).encode('utf-8'))
+            return
+        return Hasher.save(self, obj)
 
 def hash(obj, hash_name='md5', coerce_mmap=False):
     """ Quick calculation of a hash to identify uniquely Python objects
@@ -87,4 +113,10 @@ def hash(obj, hash_name='md5', coerce_mmap=False):
         coerce_mmap: boolean
             Make no difference between np.memmap and np.ndarray
     """
-    pass
+    try:
+        import numpy as np
+        hasher = NumpyHasher(hash_name=hash_name, coerce_mmap=coerce_mmap)
+    except ImportError:
+        hasher = Hasher(hash_name=hash_name)
+    hasher.save(obj)
+    return hasher._hash.hexdigest()
