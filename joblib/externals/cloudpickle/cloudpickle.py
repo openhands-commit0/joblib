@@ -118,7 +118,24 @@ def _whichmodule(obj, name):
     - Errors arising during module introspection are ignored, as those errors
       are considered unwanted side effects.
     """
-    pass
+    if isinstance(obj, type) and obj.__module__ == '__main__':
+        return obj.__module__
+
+    module_name = getattr(obj, '__module__', None)
+    if module_name is not None:
+        return module_name
+
+    # Protect the iteration by using a copy of sys.modules against dynamic
+    # modules that trigger imports of other modules upon calls to getattr
+    for module_name, module in list(sys.modules.items()):
+        if module_name == '__main__' or module is None:
+            continue
+        try:
+            if _getattribute(module, name)[0] is obj:
+                return module_name
+        except Exception:
+            pass
+    return None
 
 def _should_pickle_by_reference(obj, name=None):
     """Test whether an function or a class should be pickled by reference
@@ -134,11 +151,58 @@ def _should_pickle_by_reference(obj, name=None):
     functions and classes or for attributes of modules that have been
     explicitly registered to be pickled by value.
     """
-    pass
+    if name is None:
+        name = getattr(obj, '__name__', None)
+    if name is None:
+        return False
+
+    module_name = _whichmodule(obj, name)
+    if module_name is None:
+        return False
+
+    if module_name == "__main__":
+        return False
+
+    module = sys.modules.get(module_name, None)
+    if module is None:
+        return False
+
+    if module_name in _PICKLE_BY_VALUE_MODULES:
+        return False
+
+    if not hasattr(module, "__file__"):
+        # Module is not a regular Python module with source code, for instance
+        # it could live in a zip file as this is the case for stdlib modules in
+        # the Windows binary distribution of Python.
+        return True
+
+    # Check if the module has been explicitly registered to be pickled by value
+    if module.__file__ is None:
+        return False
+
+    return True
 
 def _extract_code_globals(co):
     """Find all globals names read or written to by codeblock co."""
-    pass
+    if co in _extract_code_globals_cache:
+        return _extract_code_globals_cache[co]
+
+    out_names = set()
+    for instr in _walk_global_ops(co):
+        if instr.opname in ("LOAD_GLOBAL", "STORE_GLOBAL", "DELETE_GLOBAL"):
+            # Extract the names of globals that are read/written to by adding
+            # `LOAD_GLOBAL`, `STORE_GLOBAL`, `DELETE_GLOBAL` opcodes
+            # to `out_names`.
+            out_names.add(co.co_names[instr.arg])
+
+    # Add the names of the global variables used in nested functions
+    if co.co_consts:
+        for const in co.co_consts:
+            if isinstance(const, types.CodeType):
+                out_names.update(_extract_code_globals(const))
+
+    _extract_code_globals_cache[co] = out_names
+    return out_names
 
 def _find_imported_submodules(code, top_level_dependencies):
     """Find currently imported submodules used by a function.
@@ -165,7 +229,34 @@ def _find_imported_submodules(code, top_level_dependencies):
     that calling func once depickled does not fail due to concurrent.futures
     not being imported
     """
-    pass
+    submodules = []
+    for name in code.co_names:
+        for module_name, module in list(sys.modules.items()):
+            if module_name == '__main__' or module is None:
+                continue
+
+            # Skip modules that are not in the top-level dependencies
+            is_dependency = False
+            for dependency in top_level_dependencies:
+                if module_name == dependency.__name__:
+                    is_dependency = True
+                    break
+                if module_name.startswith(dependency.__name__ + '.'):
+                    is_dependency = True
+                    break
+            if not is_dependency:
+                continue
+
+            if hasattr(module, name) and getattr(module, name) is not None:
+                submodules.append(module)
+                break
+
+    # Find submodules in nested code objects
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            submodules.extend(_find_imported_submodules(const, top_level_dependencies))
+
+    return submodules
 STORE_GLOBAL = opcode.opmap['STORE_GLOBAL']
 DELETE_GLOBAL = opcode.opmap['DELETE_GLOBAL']
 LOAD_GLOBAL = opcode.opmap['LOAD_GLOBAL']
@@ -179,18 +270,27 @@ for k, v in types.__dict__.items():
 
 def _walk_global_ops(code):
     """Yield referenced name for global-referencing instructions in code."""
-    pass
+    for instr in dis.get_instructions(code):
+        op = instr.opcode
+        if op in GLOBAL_OPS:
+            yield instr
 
 def _extract_class_dict(cls):
     """Retrieve a copy of the dict of a class without the inherited method."""
-    pass
+    clsdict = dict(cls.__dict__)
+    if len(cls.__bases__) == 1:
+        inherited_dict = cls.__bases__[0].__dict__
+        for name, value in inherited_dict.items():
+            if name in clsdict and clsdict[name] is value:
+                clsdict.pop(name)
+    return clsdict
 
 def is_tornado_coroutine(func):
     """Return whether `func` is a Tornado coroutine function.
 
     Running coroutines are not supported.
     """
-    pass
+    return getattr(func, '_is_coroutine', False)
 
 def instance(cls):
     """Create a new instance of a class.
@@ -205,7 +305,7 @@ def instance(cls):
     instance : cls
         A new instance of ``cls``.
     """
-    pass
+    return cls()
 
 @instance
 class _empty_cell_value:
@@ -226,7 +326,28 @@ def _make_skeleton_class(type_constructor, name, bases, type_kwargs, class_track
     The "extra" variable is meant to be a dict (or None) that can be used for
     forward compatibility shall the need arise.
     """
-    pass
+    if class_tracker_id is not None:
+        if class_tracker_id in _DYNAMIC_CLASS_TRACKER_BY_ID:
+            return _DYNAMIC_CLASS_TRACKER_BY_ID[class_tracker_id]
+
+    # Build a new class with a custom metaclass that will make the class
+    # definition available via the class tracker at unpickling time.
+    class Meta(type):
+        def __new__(metacls, name, bases, clsdict):
+            return super().__new__(metacls, name, bases, clsdict)
+
+    # Create a new class with an empty dictionary
+    clsdict = {}
+    for k, v in type_kwargs.items():
+        clsdict[k] = v
+
+    cls = Meta(name, bases, clsdict)
+
+    if class_tracker_id is not None:
+        _DYNAMIC_CLASS_TRACKER_BY_ID[class_tracker_id] = cls
+        _DYNAMIC_CLASS_TRACKER_BY_CLASS[cls] = class_tracker_id
+
+    return cls
 
 def _make_skeleton_enum(bases, name, qualname, members, module, class_tracker_id, extra):
     """Build dynamic enum with an empty __dict__ to be filled once memoized
@@ -242,19 +363,70 @@ def _make_skeleton_enum(bases, name, qualname, members, module, class_tracker_id
     The "extra" variable is meant to be a dict (or None) that can be used for
     forward compatibility shall the need arise.
     """
-    pass
+    if class_tracker_id is not None:
+        if class_tracker_id in _DYNAMIC_CLASS_TRACKER_BY_ID:
+            return _DYNAMIC_CLASS_TRACKER_BY_ID[class_tracker_id]
+
+    metacls = type(bases[0]) if bases else type(Enum)
+    classdict = metacls.__prepare__(name, bases)
+
+    # Create a new Enum class
+    enum_class = metacls.__new__(metacls, name, bases, classdict)
+    enum_class.__module__ = module
+    enum_class.__qualname__ = qualname
+
+    # Create the enum members
+    for member_name, member_value in members:
+        enum_member = enum_class._member_type_.__new__(
+            enum_class._member_type_, member_name)
+        enum_member._name_ = member_name
+        enum_member._value_ = member_value
+        setattr(enum_class, member_name, enum_member)
+
+    if class_tracker_id is not None:
+        _DYNAMIC_CLASS_TRACKER_BY_ID[class_tracker_id] = enum_class
+        _DYNAMIC_CLASS_TRACKER_BY_CLASS[enum_class] = class_tracker_id
+
+    return enum_class
 
 def _code_reduce(obj):
     """code object reducer."""
-    pass
+    if hasattr(obj, "co_posonlyargcount"):
+        args = (
+            obj.co_argcount, obj.co_posonlyargcount,
+            obj.co_kwonlyargcount, obj.co_nlocals,
+            obj.co_stacksize, obj.co_flags, obj.co_code,
+            obj.co_consts, obj.co_names, obj.co_varnames,
+            obj.co_filename, obj.co_name, obj.co_firstlineno,
+            obj.co_lnotab, obj.co_freevars, obj.co_cellvars,
+        )
+    else:
+        args = (
+            obj.co_argcount, obj.co_kwonlyargcount,
+            obj.co_nlocals, obj.co_stacksize, obj.co_flags,
+            obj.co_code, obj.co_consts, obj.co_names,
+            obj.co_varnames, obj.co_filename,
+            obj.co_name, obj.co_firstlineno, obj.co_lnotab,
+            obj.co_freevars, obj.co_cellvars,
+        )
+    return types.CodeType, args
 
 def _cell_reduce(obj):
     """Cell (containing values of a function's free variables) reducer."""
-    pass
+    f = obj.cell_contents
+    return _empty_cell_value if f is None else f
 
 def _file_reduce(obj):
     """Save a file."""
-    pass
+    import io
+
+    if obj.closed:
+        raise pickle.PicklingError("Cannot pickle closed files")
+
+    if obj.mode == 'r':
+        return io.StringIO, (obj.read(),)
+    else:
+        raise pickle.PicklingError("Cannot pickle files in write mode")
 
 def _dynamic_class_reduce(obj):
     """Save a class that can't be referenced as a module attribute.
@@ -263,11 +435,53 @@ def _dynamic_class_reduce(obj):
     functions, or that otherwise can't be serialized as attribute lookups
     from importable modules.
     """
-    pass
+    if obj is type(None):
+        return type, (None,)
+
+    # Get the type of the class
+    type_constructor = type(obj)
+
+    # Get the class name
+    name = obj.__name__
+
+    # Get the class bases
+    bases = obj.__bases__
+
+    # Get the class dict
+    dict_items = _extract_class_dict(obj).items()
+
+    # Get the class module
+    module = obj.__module__
+
+    # Get the class qualname
+    qualname = getattr(obj, "__qualname__", None)
+
+    # Get the class tracker id
+    class_tracker_id = _DYNAMIC_CLASS_TRACKER_BY_CLASS.get(obj)
+
+    # Build the type kwargs
+    type_kwargs = {
+        "__module__": module,
+        "__qualname__": qualname,
+    }
+
+    # Return the class constructor and its arguments
+    return _make_skeleton_class, (type_constructor, name, bases, type_kwargs,
+                                class_tracker_id, None)
 
 def _class_reduce(obj):
     """Select the reducer depending on the dynamic nature of the class obj."""
-    pass
+    if obj is type(None):
+        return type, (None,)
+    elif obj is type(Ellipsis):
+        return type, (Ellipsis,)
+    elif obj is type(NotImplemented):
+        return type, (NotImplemented,)
+    elif obj in _BUILTIN_TYPE_NAMES:
+        return obj.__name__
+    elif not _should_pickle_by_reference(obj):
+        return _dynamic_class_reduce(obj)
+    return NotImplemented
 
 def _function_setstate(obj, state):
     """Update the state of a dynamic function.
@@ -276,7 +490,12 @@ def _function_setstate(obj, state):
     cannot rely on the native setstate routine of pickle.load_build, that calls
     setattr on items of the slotstate. Instead, we have to modify them inplace.
     """
-    pass
+    state, slotstate = state
+    obj.__dict__.update(state)
+
+    obj_globals = obj.__globals__
+    obj_globals.clear()
+    obj_globals.update(slotstate)
 _DATACLASSE_FIELD_TYPE_SENTINELS = {dataclasses._FIELD.name: dataclasses._FIELD, dataclasses._FIELD_CLASSVAR.name: dataclasses._FIELD_CLASSVAR, dataclasses._FIELD_INITVAR.name: dataclasses._FIELD_INITVAR}
 
 class Pickler(pickle.Pickler):
@@ -311,7 +530,21 @@ class Pickler(pickle.Pickler):
 
     def _dynamic_function_reduce(self, func):
         """Reduce a function that is not pickleable via attribute lookup."""
-        pass
+        if is_tornado_coroutine(func):
+            return NotImplemented
+
+        if PYPY:
+            # PyPy does not have the concept of builtin-functions, so
+            # reduce them as normal functions.
+            return self._function_reduce(func)
+
+        # Handle builtin functions
+        if hasattr(func, '__code__') and isinstance(func.__code__, builtin_code_type):
+            return self._builtin_function_reduce(func)
+
+        # Handle normal functions
+        state = _function_getstate(func)
+        return _function_setstate, (func.__new__(type(func)), state)
 
     def _function_reduce(self, obj):
         """Reducer for function objects.
@@ -322,7 +555,13 @@ class Pickler(pickle.Pickler):
         obj using a custom cloudpickle reducer designed specifically to handle
         dynamic functions.
         """
-        pass
+        if obj.__module__ == "__main__":
+            return self._dynamic_function_reduce(obj)
+
+        if _should_pickle_by_reference(obj):
+            return NotImplemented
+
+        return self._dynamic_function_reduce(obj)
 
     def __init__(self, file, protocol=None, buffer_callback=None):
         if protocol is None:
@@ -364,7 +603,12 @@ class Pickler(pickle.Pickler):
               reducers, such as Exceptions. See
               https://github.com/cloudpipe/cloudpickle/issues/248
             """
-            pass
+            if isinstance(obj, type):
+                return _class_reduce(obj)
+            elif isinstance(obj, types.FunctionType):
+                return self._function_reduce(obj)
+            else:
+                return NotImplemented
     else:
         dispatch = pickle.Pickler.dispatch.copy()
 
@@ -374,7 +618,12 @@ class Pickler(pickle.Pickler):
             The name of this method is somewhat misleading: all types get
             dispatched here.
             """
-            pass
+            if isinstance(obj, type):
+                return self.save_reduce(_class_reduce(obj), obj=obj)
+            elif isinstance(obj, types.FunctionType):
+                return self.save_reduce(self._function_reduce(obj), obj=obj)
+            else:
+                return super().save_global(obj, name=name, pack=pack)
         dispatch[type] = save_global
 
         def save_function(self, obj, name=None):
@@ -383,7 +632,10 @@ class Pickler(pickle.Pickler):
             Determines what kind of function obj is (e.g. lambda, defined at
             interactive prompt, etc) and handles the pickling appropriately.
             """
-            pass
+            if isinstance(obj, types.FunctionType):
+                return self.save_reduce(self._function_reduce(obj), obj=obj)
+            else:
+                return super().save_function(obj, name=name)
 
         def save_pypy_builtin_func(self, obj):
             """Save pypy equivalent of builtin functions.
