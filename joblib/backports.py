@@ -90,18 +90,36 @@ try:
           newly-created memmap that sends a maybe_unlink request for the
           memmaped file to resource_tracker.
         """
-        pass
+        if unlink_on_gc_collect:
+            util.finalize(np.memmap(filename, dtype=dtype, mode=mode,
+                                  offset=offset, shape=shape, order=order),
+                        util.get_context().resource_tracker.maybe_unlink,
+                        [filename])
+        return np.memmap(filename, dtype=dtype, mode=mode,
+                        offset=offset, shape=shape, order=order)
 except ImportError:
-if os.name == 'nt':
-    access_denied_errors = (5, 13)
-    from os import replace
+    if os.name == 'nt':
+        access_denied_errors = (5, 13)
+        from os import replace
 
-    def concurrency_safe_rename(src, dst):
-        """Renames ``src`` into ``dst`` overwriting ``dst`` if it exists.
+        def concurrency_safe_rename(src, dst):
+            """Renames ``src`` into ``dst`` overwriting ``dst`` if it exists.
 
-        On Windows os.replace can yield permission errors if executed by two
-        different processes.
-        """
-        pass
-else:
-    from os import replace as concurrency_safe_rename
+            On Windows os.replace can yield permission errors if executed by two
+            different processes.
+            """
+            max_retries = 10
+            retry_delay = 0.001  # Initial delay set to 1ms
+            for i in range(max_retries):
+                try:
+                    replace(src, dst)
+                    break
+                except OSError as e:
+                    if e.winerror not in access_denied_errors:
+                        raise
+                    if i == max_retries - 1:
+                        raise
+                    time.sleep(retry_delay)
+                    retry_delay *= 1.5
+    else:
+        from os import replace as concurrency_safe_rename
