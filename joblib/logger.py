@@ -9,8 +9,12 @@ import sys
 import os
 import shutil
 import logging
-import pprint
+import pprint as _pprint
 from .disk import mkdirp
+
+def pformat(obj, depth=3):
+    """Return a formatted representation of the object."""
+    return _pprint.pformat(obj, depth=depth)
 
 def _squeeze_time(t):
     """Remove .1s to the time under Windows: this is the time it take to
