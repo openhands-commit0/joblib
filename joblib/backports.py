@@ -74,6 +74,33 @@ class LooseVersion(Version):
 
     def __repr__(self):
         return "LooseVersion ('%s')" % str(self)
+def _concurrency_safe_rename_win32(src, dst):
+    """Renames ``src`` into ``dst`` overwriting ``dst`` if it exists.
+
+    On Windows os.replace can yield permission errors if executed by two
+    different processes.
+    """
+    max_retries = 10
+    retry_delay = 0.001  # Initial delay set to 1ms
+    for i in range(max_retries):
+        try:
+            replace(src, dst)
+            break
+        except OSError as e:
+            if e.winerror not in access_denied_errors:
+                raise
+            if i == max_retries - 1:
+                raise
+            time.sleep(retry_delay)
+            retry_delay *= 1.5
+
+if os.name == 'nt':
+    access_denied_errors = (5, 13)
+    from os import replace
+    concurrency_safe_rename = _concurrency_safe_rename_win32
+else:
+    from os import replace as concurrency_safe_rename
+
 try:
     import numpy as np
 
@@ -98,28 +125,4 @@ try:
         return np.memmap(filename, dtype=dtype, mode=mode,
                         offset=offset, shape=shape, order=order)
 except ImportError:
-    if os.name == 'nt':
-        access_denied_errors = (5, 13)
-        from os import replace
-
-        def concurrency_safe_rename(src, dst):
-            """Renames ``src`` into ``dst`` overwriting ``dst`` if it exists.
-
-            On Windows os.replace can yield permission errors if executed by two
-            different processes.
-            """
-            max_retries = 10
-            retry_delay = 0.001  # Initial delay set to 1ms
-            for i in range(max_retries):
-                try:
-                    replace(src, dst)
-                    break
-                except OSError as e:
-                    if e.winerror not in access_denied_errors:
-                        raise
-                    if i == max_retries - 1:
-                        raise
-                    time.sleep(retry_delay)
-                    retry_delay *= 1.5
-    else:
-        from os import replace as concurrency_safe_rename
+    make_memmap = None
